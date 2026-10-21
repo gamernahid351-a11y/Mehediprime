@@ -1,0 +1,8 @@
+aiohttp==3.9.5
+httpx==0.27.0
+google-play-scraper==1.2.7
+pycryptodome==3.20.0
+protobuf==4.25.3
+protobuf-decoder>=0.5
+requests==2.31.0
+urllib3==2.2.1
