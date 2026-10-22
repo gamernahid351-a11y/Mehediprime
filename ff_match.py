@@ -1,5 +1,13 @@
 """
 Match session: a layered rewrite of the follow bot.
+
+Four layers:
+    MatchState       the only source of truth.
+    MovementPlanner  pure logic. Given a snapshot it returns the next position.
+    PacketRouter     a table of command -> handler.
+    MatchSession     owns the socket and the lifecycle.
+
+Wire-level details stay in ff_udp - this module is about behaviour, not bytes.
 """
 
 import math
@@ -8,6 +16,7 @@ import threading
 import time
 
 import ff_udp
+import homor_skill
 
 try:
     import match_api
@@ -21,7 +30,8 @@ except ImportError:
         Chat_CommandUdp = True
         AutoSafeZone = True
         AutoXp = True
-        Use_Plane_Phase = True
+        Use_Plane_Phase = False
+        Clash_Mode = 15
         WAIT_LOBBY_TIME = 30.0
         PLANE_DURATION = 30.0
         PLANE_START_HEIGHT = 36000.0
@@ -32,10 +42,6 @@ except ImportError:
         PLANE_SPEED = 8000.0
         LANDING_TARGET = (0.0, 0.0)
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 SEND_HZ = 10.0
 MOVE_INTERVAL = 1.0 / SEND_HZ
@@ -51,6 +57,9 @@ CMD_KNOCK_DOWN = 139
 CMD_KNOCK_REVIVE = 140
 CMD_START_RESCUE = 142
 CMD_STOP_RESCUE = 143
+CMD_USE_ACTIVE_SKILL = 248
+CMD_STOP_ACTIVE_SKILL = 249
+CMD_SYNC_ACTIVE_SKILL_STATE = 250
 CMD_PENDING_REVIVE = 256
 CMD_REVIVE = 393
 CMD_SHOW_MATCH_RESULT = 407
@@ -91,10 +100,6 @@ BLOCK_DIST = 1500.0
 BLOCK_TICKS = 5
 SLIDE_ANGLE = 65.0
 SLIDE_HOLD = 1.5
-
-# ═══════════════════════════════════════════════════════════════════════
-# PLANE PHASE CONSTANTS
-# ═══════════════════════════════════════════════════════════════════════
 
 PLANE_PHASE_NONE = "none"
 PLANE_PHASE_WAITING = "waiting"
@@ -533,6 +538,9 @@ class PacketRouter(object):
             CMD_KNOCK_REVIVE: session.on_revive_done,
             CMD_START_RESCUE: session.on_rescue_started,
             CMD_STOP_RESCUE: session.on_rescue_stopped,
+            CMD_USE_ACTIVE_SKILL: session.on_skill_cast_ack,
+            CMD_STOP_ACTIVE_SKILL: session.on_skill_stop_ack,
+            CMD_SYNC_ACTIVE_SKILL_STATE: session.on_skill_state_sync,
             CMD_PENDING_REVIVE: session.on_down,
             CMD_REVIVE: session.on_revive,
             CMD_GRI_SYNC: session.on_gri,
@@ -564,6 +572,7 @@ class MatchSession(object):
                  suffix="0", verbose=True, api_token=None, match_id=0):
         self.addr = (ip, int(port))
         self.account_id = int(account_id)
+        self.game_mode = 15
         self.secret = secret
         self.key = bytes.fromhex(secret)
         self.order = ff_udp.parse_udp_mask(udp_mask)
@@ -592,6 +601,7 @@ class MatchSession(object):
         self.packets_in = 0
         self.decoded_in = 0
         self._last_rescue_send = 0.0
+        self.homor = homor_skill.HomorSkill()
 
     def say(self, msg):
         if self.verbose:
@@ -602,12 +612,13 @@ class MatchSession(object):
         if self.verbose and self.errors <= 20:
             print("[warn] %s" % msg)
 
-    # ═══════════════════════════════════════════════════════════════════
-    # PLANE PHASE HANDLER
-    # ═══════════════════════════════════════════════════════════════════
     def _plane_phase_handler(self, snap, now):
-        """Handle plane phase. Returns True if movement should be BLOCKED."""
         if not getattr(config, "Use_Plane_Phase", True):
+            return False
+        if self.game_mode in (getattr(config, "Clash_Mode", 15),
+                              getattr(config, "CsRank_Mode", 17)):
+            return False
+        if snap.phase is not None:
             return False
 
         phase = snap.plane_phase
@@ -697,8 +708,6 @@ class MatchSession(object):
             return False
 
         return False
-
-    # -- packet handlers -------------------------------------------------
 
     def on_player_join(self, body, now):
         info = ff_udp.parse_player_join(body)
@@ -889,7 +898,27 @@ class MatchSession(object):
         else:
             self.say("zone: centre=%s radius=%d" % (center, radius))
 
-    # -- socket ----------------------------------------------------------
+    def on_skill_cast_ack(self, body, now):
+        snap = self.state.snapshot()
+        pid = None
+        if body:
+            try:
+                pid, _ = ff_udp._rd_varint(body, 0)
+            except Exception:
+                pass
+        who = "us" if (snap.my_id is not None and pid == snap.my_id) else (
+            ("0x%08X" % pid) if pid else "?")
+        self.say("homor[%d]: ✅ server ACCEPTED cast (%s) — %dB"
+                 % (self.account_id, who, len(body) if body else 0))
+
+    def on_skill_stop_ack(self, body, now):
+        self.say("homor[%d]: ⏹ skill stop ack — %dB"
+                 % (self.account_id, len(body) if body else 0))
+
+    def on_skill_state_sync(self, body, now):
+        self.say("homor[%d]: 📡 skill state sync — %dB %s"
+                 % (self.account_id, len(body) if body else 0,
+                    body[:16].hex() if body else ""))
 
     def send(self, cmd, body, send_option=None, flags=None):
         if self.sock is None:
@@ -906,8 +935,6 @@ class MatchSession(object):
         except Exception as exc:
             self.log_error("send cmd %d: %r" % (cmd, exc))
             return False
-
-    # -- threads ---------------------------------------------------------
 
     def _receiver(self):
         while not self._stop.is_set():
@@ -950,43 +977,50 @@ class MatchSession(object):
                 if not snap.alive:
                     continue
 
-                # ═══════════════════════════════════════════════════════
-                # PLANE PHASE — position sync only
-                # ═══════════════════════════════════════════════════════
                 if self._plane_phase_handler(snap, now):
                     if snap.my_pos and snap.my_id:
                         pos = (int(snap.my_pos[0]),
                                int(snap.my_pos[1]),
                                int(snap.my_pos[2]))
-                        tick = self.planner.server_time(snap, now)
-
-                        # JUMP + PARACHUTE → airborne state (4,0).
-                        # Matches C2S_MOVE_JUMP_START / C2S_MOVE_PARACHUTE_OPEN:
-                        #   body: ... 04 00 ... (state=4, pose=0)
-                        # WAITING / PLANE → walk state (0,0), no airborne marker.
-                        if snap.plane_phase in (PLANE_PHASE_JUMP,
-                                                PLANE_PHASE_PARACHUTE):
-                            vx, vz = 0.0, 0.0
-                            yaw_now = self.planner.next_yaw()
-                            if snap.plane_phase == PLANE_PHASE_PARACHUTE:
-                                rad = math.radians(yaw_now)
-                                vx = math.sin(rad) * 3000.0
-                                vz = math.cos(rad) * 3000.0
-                            ff_udp.send_airborne_position(
-                                self.sock, self.addr, self.key, self.order,
-                                snap.my_id, pos, tick,
-                                horizontal_vel=(vx, vz),
-                                yaw=yaw_now)
-                        else:
-                            ff_udp.send_position(
-                                self.sock, self.addr, self.key, self.order,
-                                snap.my_id, pos, pos,
-                                tick, aim_yaw=0)
+                        ff_udp.send_position(
+                            self.sock, self.addr, self.key, self.order,
+                            snap.my_id, pos, pos,
+                            self.planner.server_time(snap, now),
+                            aim_yaw=0)
                     continue
 
-                # ═══════════════════════════════════════════════════════
-                # NORMAL MOVEMENT (on ground + fight phase)
-                # ═══════════════════════════════════════════════════════
+                # ── HOMOR SKILL — ROUND-BY-ROUND ──
+                if (self.homor.should_cast_round(
+                        now, snap.joined_at, snap.round_no, snap.phase)
+                        and snap.my_pos is not None
+                        and snap.my_id is not None):
+                    try:
+                        px, py, pz = (int(snap.my_pos[0]),
+                                      int(snap.my_pos[1]),
+                                      int(snap.my_pos[2]))
+                        body = homor_skill.build_skill_body(
+                            snap.my_id,
+                            self.homor.skill_id,
+                            self.planner.server_time(snap, now),
+                            px, py, pz,
+                        )
+                        self.send(
+                            homor_skill.CMD_USE_ACTIVE_SKILL,
+                            body,
+                            send_option=ff_udp.SENDOPTION_RELIABLE,
+                        )
+                        self.homor.mark_fired_round(snap.round_no)
+                        self.homor.mark_cast(now)
+                        self.say("homor[%d]: skill 5506 fired round=%s phase=%s pos=(%d, %d, %d) tick=%d"
+                                 % (self.account_id,
+                                    snap.round_no,
+                                    PHASE_NAMES.get(snap.phase,
+                                                    "phase%d" % (snap.phase or 0)),
+                                    px, py, pz,
+                                    self.planner.server_time(snap, now)))
+                    except Exception as exc:
+                        self.log_error("homor cast: %r" % exc)
+
                 self._tend_downed(snap, now)
                 planned = self.planner.plan(snap, now)
                 if planned is None:
@@ -1008,31 +1042,6 @@ class MatchSession(object):
             except Exception as exc:
                 self.log_error("sender: %r" % exc)
                 time.sleep(MOVE_INTERVAL)
-
-    def jump_on_ground(self):
-        """Send a single airborne tick while on the ground — a visible jump.
-
-        From C2S_MOVE_JUMP_START captures: state=4, pose=0, jump byte 0.
-        Server interprets state=4 as the player leaving the ground for that
-        tick. Call this from a firing loop or planner when we want the bot
-        to actually hop instead of walk.
-        """
-        snap = self.state.snapshot()
-        if snap.my_id is None or snap.my_pos is None or not snap.alive:
-            return False
-        pos = (int(snap.my_pos[0]), int(snap.my_pos[1]), int(snap.my_pos[2]))
-        try:
-            ff_udp.send_airborne_position(
-                self.sock, self.addr, self.key, self.order,
-                snap.my_id, pos,
-                self.planner.server_time(snap, time.time()),
-                horizontal_vel=(0.0, 0.0), yaw=0)
-            return True
-        except Exception as exc:
-            self.log_error("jump_on_ground: %r" % (exc,))
-            return False
-
-    # -- lifecycle -------------------------------------------------------
 
     def _tend_downed(self, snap, now):
         if snap.rescuing is not None:
@@ -1066,12 +1075,15 @@ class MatchSession(object):
         self.say("reviving 0x%08X (short %d)" % (full_id, short))
 
     def _nearest_downed(self, snap):
+        # First pass: prefer teammates whose position we know and who are in range.
         best = None
         best_dist = REVIVE_RANGE
+        no_pos_fallback = None
         for short, pos in snap.downed.items():
             if pos is None:
-                if best is None:
-                    best = short
+                # Remember first unknown-position teammate as last-resort fallback.
+                if no_pos_fallback is None:
+                    no_pos_fallback = short
                 continue
             dx = pos[0] - snap.my_pos[0]
             dz = pos[2] - snap.my_pos[2]
@@ -1079,10 +1091,13 @@ class MatchSession(object):
             if dist <= best_dist:
                 best = short
                 best_dist = dist
-        return best
+        # Only fall back to a no-position teammate when nobody with a known position
+        # is in range — avoids burning revive windows on teammates that are far away.
+        return best if best is not None else no_pos_fallback
 
     def run(self, game_mode=15, map_id=1, match_mode=1, sleep_ms=0,
             timeout=3.0):
+        self.game_mode = int(game_mode)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(0.2)
         self.say("=== match session -> %s:%d ===" % self.addr)

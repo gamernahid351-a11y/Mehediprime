@@ -41,15 +41,17 @@ Safe_Mode_Gap_Max = 19.0
 Claim_Wait = 45.0
 
 Clash_Mode = 15
+CsRank_Mode = 17
 LoneWolf_Mode = 43
 LoneWolf_MinLevel = 3
 
 # Which mode to queue when the bot starts.
-#   "clash"     - always Clash Squad (15)
-#   "lone_wolf" - always Lone Wolf (43)
-#   "default"   - auto: Lone Wolf at LoneWolf_MinLevel+, else Clash
+#   "clash"     - Clash Squad normal (15)
+#   "cs_rank"   - CS Rank (17)
+#   "lone_wolf" - Lone Wolf (43)
+#   "default"   - CS Rank
 # bot.py can override this at launch (menu or: python bot.py 1|2|3).
-Play_Mode = "default"
+Play_Mode = "cs_rank"
 
 Udp_Match_Timeout = 900.0
 Shutdown_Delay = 30.0
@@ -109,7 +111,7 @@ Movement_Only_On_Ground = True
 
 
 # ── Plane / Jump / Landing Phase ──
-Use_Plane_Phase = True
+Use_Plane_Phase = False
 WAIT_LOBBY_TIME = 30.0
 PLANE_DURATION = 30.0
 PLANE_START_HEIGHT = 36000.0
@@ -147,7 +149,10 @@ Auth_Watermark_Enabled = False
 Auth_Watermark_Key = None
 
 Fallback_Region = "ME"
-Fallback_Skill_Cooldown = 59.0
+# Skill cooldown used until a Cmd 250 arrives with the server's real value.
+# The homor active skill (id 5506, not 706 which is a cmd id) refreshes every 30 seconds in game; the
+# value here is what use_skill() falls back to when no Cmd 250 has been seen.
+Fallback_Skill_Cooldown = 30.0
 Fallback_Client_Version = "1.132.6"
 Fallback_Release_Version = "OB55"
 

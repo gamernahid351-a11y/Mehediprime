@@ -40,7 +40,12 @@ class ActiveSession(MatchSession):
         self.ammo = CLIP_SIZE
         self.bought = False
         self._acted = 0.0
-        self.skill_id = config.LIVE.get_skill_id()
+        # Skill id fallback: LIVE.get_skill_id() is 0 until the server sends
+        # a Cmd 250 with the equipped skill. If the account's preset carries
+        # homor (706) and the server never echoes it, use_skill() bails on
+        # `not self.skill_id` and the cast never goes out. 706 is the value
+        # we want here; a Cmd 250 that does arrive will overwrite it.
+        self.skill_id = config.LIVE.get_skill_id() or 5506  # 5506 = homor skill id; 706 was a cmd id, not skill
         self._skill_ready = 0.0
         self.router.handlers[CMD_PICKUP] = self.on_pickup
         self.router.handlers[CMD_SKILL_STATE] = self.on_skill_state
