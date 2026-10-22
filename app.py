@@ -79,7 +79,7 @@ MIN_REFIRE_INTERVAL = 2.0
 
 # ── INSTANCE LIMITS ──
 MAX_INSTANCES = 5
-INSTANCE_TIMEOUT = 8 * 3600   # 8h — non-stop, then DELETE
+INSTANCE_TIMEOUT = 8 * 3600
 
 # ── INSTANCE STATE ──
 _instance_start_times: Dict[str, float] = {}
@@ -225,7 +225,6 @@ def _active_instance_count() -> int:
 
 
 async def _instance_timeout_watch(group_id: str):
-    """After INSTANCE_TIMEOUT (8h) → kill workers + DELETE team file + free slot."""
     try:
         await asyncio.sleep(INSTANCE_TIMEOUT)
     except asyncio.CancelledError:
@@ -243,7 +242,6 @@ async def _instance_timeout_watch(group_id: str):
     except Exception:
         pass
 
-    # Kill all workers + remove from dashboard
     if target:
         for acc in target["accounts"]:
             uid = str(acc["uid"])
@@ -259,7 +257,6 @@ async def _instance_timeout_watch(group_id: str):
             if uid in bot_state.accounts:
                 del bot_state.accounts[uid]
 
-    # Delete team file
     try:
         path = _team_file_path(group_id)
         if os.path.exists(path):
@@ -268,7 +265,6 @@ async def _instance_timeout_watch(group_id: str):
     except Exception as e:
         print_error(f"[INSTANCE] delete file failed: {e}")
 
-    # Clear caches + state
     _team_states.pop(str(group_id), None)
     _instance_start_times.pop(group_id, None)
     _instance_timeout_tasks.pop(group_id, None)
@@ -280,8 +276,8 @@ async def _instance_timeout_watch(group_id: str):
             pass
 
     print_success(
-        f"[INSTANCE] {group_id} fully removed — "
-        f"slot freed ({_active_instance_count()}/{MAX_INSTANCES})"
+        f"[INSTANCE] {group_id} fully removed — slot freed "
+        f"({_active_instance_count()}/{MAX_INSTANCES})"
     )
 
 
@@ -872,21 +868,11 @@ def _extract_key_iv(res_json):
 
 
 def _get_field_raw(res_json: Dict, k: int):
-    """Robust field extraction — decoder first, raw bytes as fallback.
-
-    The Parser returns nested decodes for many length-delimited fields, and
-    a JWT string like 'eyJhbGci...' can nested-parse as an empty message
-    (`{"data": {}}`) instead of the actual text. That was the exact bug that
-    caused `missing jwt/url` even though MajorLogin returned 200 with 986
-    bytes — the JWT was there, the decoder just returned an empty dict.
-    Raw bytes are the ground truth.
-    """
     v = res_json.get(str(k))
     if isinstance(v, dict) and "data" in v:
         d = v["data"]
         if d:
             return d
-
     if "__RAW_HEX__" in res_json and "__OFFSET__" in res_json:
         try:
             raw = bytes.fromhex(res_json["__RAW_HEX__"])
@@ -897,41 +883,18 @@ def _get_field_raw(res_json: Dict, k: int):
                 if isinstance(val, (bytes, bytearray)):
                     try:
                         s = val.decode('utf-8')
-                        if s:
-                            return s
-                    except Exception:
-                        pass
+                        if s: return s
+                    except Exception: pass
                     return val.hex()
                 return val
-        except Exception:
-            pass
-    return None
-
-
-def _get_field_raw_temp(raw_bytes: bytes, offset: int, k: int):
-    """Inline helper — extract field k from raw[offset:]."""
-    try:
-        rf = extract_raw_fields(raw_bytes[offset:])
-        if k in rf:
-            val = rf[k]
-            if isinstance(val, (bytes, bytearray)):
-                try:
-                    s = val.decode('utf-8')
-                    if s:
-                        return s
-                except Exception:
-                    pass
-                return val.hex()
-            return val
-    except Exception:
-        pass
+        except Exception: pass
     return None
 
 
 async def aes_encrypt(payload, key, iv):
     return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(payload, AES.block_size))
 
-# ==================== VERSION CACHE (auto.json persistent) ====================
+# ==================== VERSION CACHE ====================
 def _atomic_json_write(path: str, data):
     try:
         tmp = path + ".tmp"
@@ -943,7 +906,6 @@ def _atomic_json_write(path: str, data):
 
 
 def _load_auto_cache() -> Optional[Dict]:
-    """Load persistent auto.json — never expires."""
     if not os.path.exists(AUTO_CACHE_FILE):
         return None
     try:
@@ -1092,15 +1054,26 @@ async def register_account(password, gop_url, app_version):
         "Authorization": f"Signature {sig}",
         "Accept": "application/json",
         "Content-Type": "application/json; charset=utf-8"}
-    try:
-        async with aiohttp.ClientSession(connector=connector) as s:
-            async with s.post(f"{gop_url}/api/v2/oauth/guest:register",
-                              headers=headers, data=payload,
-                              timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                data = json.loads(await resp.text())
-                if data.get("code") == 0: return data["data"]["uid"]
-    except Exception as e:
-        print_error(f"[REGISTER] {e}")
+
+    for attempt in range(4):
+        try:
+            async with aiohttp.ClientSession(connector=connector) as s:
+                async with s.post(f"{gop_url}/api/v2/oauth/guest:register",
+                                  headers=headers, data=payload,
+                                  timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    text = await resp.text()
+                    try:
+                        data = json.loads(text)
+                    except Exception:
+                        print_warning(f"[REGISTER] attempt {attempt+1}: invalid json")
+                        await asyncio.sleep(3.0 + attempt * 2.0)
+                        continue
+                    if data.get("code") == 0:
+                        return data["data"]["uid"]
+                    print_warning(f"[REGISTER] attempt {attempt+1}: code={data.get('code')} msg={data.get('message', text[:60])}")
+        except Exception as e:
+            print_error(f"[REGISTER] attempt {attempt+1}: {e}")
+        await asyncio.sleep(3.0 + attempt * 2.0)
     return None
 
 async def grant_token(uid, password, gop_url, app_version):
@@ -1109,9 +1082,46 @@ async def grant_token(uid, password, gop_url, app_version):
     oid, at, pf = result
     return {"open_id": oid, "access_token": at, "platform": pf}
 
+# ==================== DEVICE ====================
+def _generate_new_device():
+    dl = [("Samsung","SM-G998B","Adreno (TM) 660","Android OS 12 / API-31"),
+        ("Xiaomi","2201122G","Adreno (TM) 730","Android OS 13 / API-33"),
+        ("Realme","RMX3700","Mali-G710","Android OS 14 / API-34"),
+        ("OnePlus","CPH2451","Adreno (TM) 740","Android OS 13 / API-33"),
+        ("OPPO","CPH2611","Adreno (TM) 720","Android OS 14 / API-34")]
+    brand, model, gpu, os_ver = random.choice(dl)
+    return {"unique_device_id":f"Google|{uuid.uuid4()}","brand":brand,"model":model,
+            "gpu_renderer":gpu,"system_software":os_ver,
+            "screen_width":random.choice([1080,1440,720]),
+            "screen_height":random.choice([2400,3200,1600]),
+            "screen_dpi":str(random.randint(300,420)),"memory":random.randint(2800,6500)}
+
+
+def get_device_for_account(acc_key):
+    devices = {}
+    if os.path.exists(DEVICES_FILE):
+        try:
+            with open(DEVICES_FILE,"r",encoding="utf-8") as f:
+                devices = json.load(f)
+                if not isinstance(devices, dict): devices = {}
+        except Exception: devices = {}
+    key = str(acc_key)
+    if key in devices: return devices[key]
+    nd = _generate_new_device()
+    devices[key] = nd
+    try:
+        with open(DEVICES_FILE,"w",encoding="utf-8") as f:
+            json.dump(devices, f, indent=2)
+    except Exception: pass
+    return nd
+
 # ==================== PAYLOAD ====================
-async def get_payload(access_token, open_id, platform, version, lang_code="en"):
-    device_id = f"Google|{uuid.uuid4()}"
+async def get_payload(access_token, open_id, platform, version, lang_code="en", acc_key=None):
+    if acc_key:
+        device = get_device_for_account(str(acc_key))
+        device_id = device["unique_device_id"]
+    else:
+        device_id = f"Google|{uuid.uuid4()}"
     major_login = {
         "3": str(datetime.now())[:-7], "4": "free fire", "5": 1,
         "7": f"{version}",
@@ -1155,7 +1165,7 @@ async def get_payload(access_token, open_id, platform, version, lang_code="en"):
     return bytes.fromhex(encrypt_aes(proto1)), bytes.fromhex(encrypt_aes(proto2))
 
 
-# ==================== MAJOR LOGIN (robust) ====================
+# ==================== MAJOR LOGIN ====================
 async def major_login(payload, login_url, release_version):
     url = f"{login_url.rstrip('/')}/MajorLogin"
     req_headers = {
@@ -1170,118 +1180,150 @@ async def major_login(payload, login_url, release_version):
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
             async with session.post(url, headers=req_headers, data=payload, ssl=ssl_context) as response:
-                response_content = await response.read()
-                print_info(f"[MAJOR-LOGIN] status={response.status} len={len(response_content)}")
-                if response.status != 200 or len(response_content) < 100:
+                content = await response.read()
+                print_info(f"[MAJOR-LOGIN] status={response.status} len={len(content)}")
+                if response.status != 200 or len(content) < 100:
                     return None
 
                 best = None
                 best_score = -1
                 best_off = 0
-                best_has_jwt_raw = False
 
-                offsets = sorted(set(
-                    list(range(0, 200, 2)) +
-                    [0, 4, 8, 12, 16, 20, 24, 32, 48, 56, 60, 64, 80, 96, 128, 160]
-                ))
-
+                offsets = list(range(0, min(500, len(content)), 2))
                 for offset in offsets:
-                    if offset >= len(response_content):
-                        continue
-                    cb = response_content[offset:]
+                    if offset >= len(content): break
+                    cb = content[offset:]
 
-                    raw_fields = extract_raw_fields(cb)
-                    jwt_raw = raw_fields.get(8)
-                    url_raw = raw_fields.get(10)
-                    id_raw = raw_fields.get(1)
+                    rf = extract_raw_fields(cb)
+                    jwt_raw = rf.get(8)
+                    url_raw = rf.get(10)
+                    id_raw = rf.get(1)
 
-                    has_jwt_raw = False
+                    jwt_str = None
                     if isinstance(jwt_raw, (bytes, bytearray)) and len(jwt_raw) > 20:
                         try:
                             if bytes(jwt_raw[:3]) == b"eyJ":
-                                has_jwt_raw = True
-                        except Exception:
-                            pass
+                                jwt_str = bytes(jwt_raw).decode('utf-8', 'ignore')
+                        except Exception: pass
 
-                    has_url_raw = False
+                    url_str = None
                     if isinstance(url_raw, (bytes, bytearray)) and len(url_raw) > 5:
                         try:
-                            s = bytes(url_raw[:16]).decode('ascii', 'ignore')
+                            s = bytes(url_raw).decode('utf-8', 'ignore')
                             if "://" in s or "." in s:
-                                has_url_raw = True
-                        except Exception:
-                            pass
+                                url_str = s
+                        except Exception: pass
 
                     cand = None
-                    try:
-                        cand = decode_protobuf_dict(cb)
-                    except Exception:
-                        cand = None
+                    try: cand = decode_protobuf_dict(cb)
+                    except Exception: cand = None
                     if not cand:
                         try:
                             c2 = decode_protobuf_2(cb)
-                            if c2:
-                                cand = {str(k): {"data": v} for k, v in c2.items()}
-                        except Exception:
-                            cand = None
-
-                    keys = set(cand.keys()) if cand else set()
-                    has_jwt_parser = ("8" in keys) or (8 in keys)
-                    has_url_parser = ("10" in keys) or (10 in keys)
-
-                    has_jwt = has_jwt_raw or has_jwt_parser
-                    has_url = has_url_raw or has_url_parser
+                            if c2: cand = {str(k): {"data": v} for k, v in c2.items()}
+                        except Exception: cand = None
 
                     score = (len(cand) if cand else 0)
-                    score += (100 if has_jwt else 0)
-                    score += (50 if has_url else 0)
-                    score += (200 if has_jwt_raw else 0)
+                    score += (300 if jwt_str else 0)
+                    score += (150 if url_str else 0)
                     score += (50 if id_raw else 0)
 
                     if score > best_score:
                         best = cand or {}
                         best_score = score
                         best_off = offset
-                        best_has_jwt_raw = has_jwt_raw
 
-                    if has_jwt_raw and has_url_raw:
+                    if jwt_str and url_str and id_raw:
                         break
 
-                if (not best or not best_has_jwt_raw):
-                    jwt_idx = response_content.find(b"eyJ")
+                final_jwt = None
+                final_url = None
+                final_accid = None
+                final_time = None
+
+                if best_off > 0 or (best is not None):
+                    try:
+                        rf_final = extract_raw_fields(content[best_off:])
+                        jr = rf_final.get(8)
+                        if isinstance(jr, (bytes, bytearray)) and bytes(jr[:3]) == b"eyJ":
+                            final_jwt = bytes(jr).decode('utf-8', 'ignore')
+                        ur = rf_final.get(10)
+                        if isinstance(ur, (bytes, bytearray)):
+                            s = bytes(ur).decode('utf-8', 'ignore')
+                            if "://" in s or "." in s:
+                                final_url = s
+                        final_accid = rf_final.get(1)
+                        final_time = rf_final.get(21)
+                    except Exception:
+                        pass
+
+                if not final_jwt:
+                    jwt_idx = content.find(b"eyJ")
                     if jwt_idx > 0:
-                        print_info(f"[MAJOR-LOGIN] JWT magic found at byte {jwt_idx}, recovering...")
-                        for back in range(2, 24, 2):
+                        for back in range(0, 30, 2):
                             try_off = jwt_idx - back
-                            if try_off < 0 or try_off >= len(response_content):
-                                continue
-                            if response_content[try_off] == 0x42:
+                            if try_off < 0: continue
+                            if content[try_off] == 0x42:
                                 try:
-                                    cand = decode_protobuf_dict(response_content[try_off:])
-                                    if cand and (("8" in cand) or (8 in cand)):
-                                        best = cand
+                                    rf_j = extract_raw_fields(content[try_off:])
+                                    jr = rf_j.get(8)
+                                    if isinstance(jr, (bytes, bytearray)) and bytes(jr[:3]) == b"eyJ":
+                                        final_jwt = bytes(jr).decode('utf-8', 'ignore')
                                         best_off = try_off
-                                        best_has_jwt_raw = True
                                         print_success(f"[MAJOR-LOGIN] JWT recovered at offset {try_off}")
+                                        if not final_url:
+                                            ur = rf_j.get(10)
+                                            if isinstance(ur, (bytes, bytearray)):
+                                                s = bytes(ur).decode('utf-8', 'ignore')
+                                                if "://" in s or "." in s:
+                                                    final_url = s
+                                        if not final_accid:
+                                            final_accid = rf_j.get(1)
+                                        if not final_time:
+                                            final_time = rf_j.get(21)
                                         break
-                                except Exception:
-                                    pass
+                                except Exception: pass
 
-                if not best:
-                    print_warning(f"[MAJOR-LOGIN] decode failed entirely")
+                if not final_url:
+                    for pattern in [b"loginbp", b"clientbp", b".ggpolarbear", b".ppmainecoonghj", b"https://"]:
+                        pidx = content.find(pattern)
+                        if pidx > 20:
+                            for back in range(2, 40, 2):
+                                try_off = pidx - back
+                                if try_off < 0: continue
+                                if content[try_off] == 0x52:
+                                    try:
+                                        rf_u = extract_raw_fields(content[try_off:])
+                                        ur = rf_u.get(10)
+                                        if isinstance(ur, (bytes, bytearray)):
+                                            s = bytes(ur).decode('utf-8', 'ignore')
+                                            if "://" in s or "." in s:
+                                                final_url = s
+                                                break
+                                    except Exception: pass
+                            if final_url: break
+
+                if not final_jwt:
+                    print_warning(f"[MAJOR-LOGIN] NO JWT — hex head: {content[:200].hex()}")
                     return None
 
-                jwt_check = _get_field_raw_temp(response_content, best_off, 8)
-                if not jwt_check:
-                    print_warning(f"[MAJOR-LOGIN] no JWT extracted — offset={best_off}")
-                    return None
+                if not final_url:
+                    final_url = "https://loginbp.ggpolarbear.com"
+                    print_warning(f"[MAJOR-LOGIN] URL missing, using fallback: {final_url}")
 
-                best["__RAW_HEX__"] = response_content.hex()
+                if best is None:
+                    best = {}
+
+                best["__JWT__"] = final_jwt
+                best["__URL__"] = final_url
+                best["__ACCID__"] = final_accid
+                best["__TIME__"] = final_time
+                best["__RAW_HEX__"] = content.hex()
                 best["__OFFSET__"] = best_off
-                jwt_len = len(jwt_check) if isinstance(jwt_check, str) else 0
-                print_success(f"[MAJOR-LOGIN] OK — offset={best_off} jwt_len={jwt_len}")
+
+                print_success(f"[MAJOR-LOGIN] OK off={best_off} jwt={len(final_jwt)} url={final_url[:40]}")
                 return best
     except Exception as e:
         print_error(f"[MAJOR-LOGIN] {e}")
@@ -2014,15 +2056,17 @@ async def process_account_uid_pass(uid, password, region_override=None):
             if not tg: return None
             open_id, access_token, platform = tg
             major_payload, login_payload = await get_payload(
-                access_token, open_id, platform, client_version)
+                access_token, open_id, platform, client_version, acc_key=str(uid))
             res_json = await major_login(major_payload, server_url, release_version)
             if not res_json: return None
-            def _gd(k):
-                return _get_field_raw(res_json, k)
-            acc_id_raw = _gd(1); region_raw = _gd(2) or "BD"
-            jwt_token = _gd(8); server_url_raw = _gd(10); server_time = _gd(21)
+            jwt_token = res_json.get("__JWT__")
+            server_url_raw = res_json.get("__URL__") or server_url
+            server_time = res_json.get("__TIME__")
+            acc_id_raw = res_json.get("__ACCID__")
+            region_raw = "BD"
+            if not jwt_token: return None
             aes_ak, iv_i = _extract_key_iv(res_json)
-            if not jwt_token or not server_url_raw or not aes_ak: return None
+            if not aes_ak: return None
             getlogin_json = await get_login_data(
                 login_payload, jwt_token, server_url_raw, release_version)
             if not getlogin_json: return None
@@ -2115,7 +2159,7 @@ def generate_password() -> str:
 async def create_four_accounts(region: str, clan_id: str, count: int = 4):
     running = _active_instance_count()
     if running >= MAX_INSTANCES:
-        print_error(f"[INSTANCE] Max {MAX_INSTANCES} instances running. Cannot create new squad.")
+        print_error(f"[INSTANCE] Max {MAX_INSTANCES} instances running.")
         return []
 
     bot_state.creating = True
@@ -2143,72 +2187,116 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4):
         for i in range(count):
             _prog(f"⌛ Creating bot {i+1}/{count}...")
             password = generate_password()
-            try:
-                uid = await register_account(password, gop_1, app_version)
-                if not uid:
-                    _prog(f"❌ bot {i+1}: register failed"); continue
-                await asyncio.sleep(1.0)
-                tok = await grant_token(uid, password, gop_1, app_version)
-                if not tok:
-                    _prog(f"❌ bot {i+1}: grant failed"); continue
-                open_id = tok["open_id"]; access_token = tok["access_token"]
-                platform = tok.get("platform", 4)
-                major_payload, login_payload = await get_payload(
-                    access_token, open_id, platform, game_version, lang)
-                nickname_final = f"Rasin__{''.join(random.choices(string.ascii_letters + string.digits, k=5))}"
-                mr = await major_register(release_v, access_token, open_id,
-                                          nickname_final, game_version, login_url, lang)
-                if not mr:
-                    _prog(f"❌ bot {i+1}: MajorRegister failed"); continue
-                await asyncio.sleep(3.0)
-                res_json = None
-                for attempt in range(3):
-                    mp, lp = await get_payload(access_token, open_id, platform, game_version, lang)
-                    res_json = await major_login(mp, login_url, release_v)
-                    if res_json and (("8" in res_json) or (8 in res_json)):
-                        login_payload = lp; break
+
+            bot_ok = False
+            for bot_attempt in range(3):
+                if bot_attempt > 0:
+                    _prog(f"   ↻ bot {i+1} attempt {bot_attempt+1}/3")
+                    await asyncio.sleep(5.0)
+
+                try:
+                    uid = await register_account(password, gop_1, app_version)
+                    if not uid:
+                        _prog(f"   ❌ bot {i+1}: register failed")
+                        continue
+                    _prog(f"   → registered UID {uid}")
+                    await asyncio.sleep(3.0)
+
+                    tok = await grant_token(uid, password, gop_1, app_version)
+                    if not tok:
+                        _prog(f"   ❌ bot {i+1}: grant failed")
+                        continue
+                    open_id = tok["open_id"]; access_token = tok["access_token"]
+                    platform = tok.get("platform", 4)
+                    await asyncio.sleep(1.0)
+
+                    major_payload, login_payload = await get_payload(
+                        access_token, open_id, platform, game_version, lang,
+                        acc_key=str(uid))
+                    nickname_final = f"Rasin__{''.join(random.choices(string.ascii_letters + string.digits, k=5))}"
+
+                    mr = await major_register(release_v, access_token, open_id,
+                                              nickname_final, game_version, login_url, lang)
+                    if not mr:
+                        _prog(f"   ❌ bot {i+1}: MajorRegister failed")
+                        continue
+                    _prog(f"   → MajorRegister OK")
+
+                    await asyncio.sleep(10.0)
+
                     res_json = None
-                    await asyncio.sleep(2.0)
-                if not res_json:
-                    _prog(f"❌ bot {i+1}: MajorLogin failed"); continue
-                def _gd(k):
-                    return _get_field_raw(res_json, k)
-                jwt_token = _gd(8); server_url_raw = _gd(10)
-                server_time = _gd(21); acc_id_raw = _gd(1)
-                if not jwt_token or not server_url_raw:
-                    _prog(f"❌ bot {i+1}: missing jwt/url"); continue
-                aes_ak, iv_i = _extract_key_iv(res_json)
-                if not aes_ak or not iv_i:
-                    _prog(f"❌ bot {i+1}: AES key fail"); continue
-                ld = await get_login_data(login_payload, jwt_token, server_url_raw, release_v)
-                level = 1; exp = 0; likes = 0
-                if ld:
-                    def _gf(f, d=None):
-                        v = ld.get(str(f), {}).get("data")
-                        return v if v is not None else d
-                    level = int(_gf(6, 1) or 1); exp = int(_gf(7, 0) or 0)
-                    likes = int(_gf(8, 0) or 0)
-                    nickname_final = _gf(4, nickname_final) or nickname_final
-                await get_newbie_roles(jwt_token, server_url_raw, release_v)
-                await asyncio.sleep(0.5)
-                await set_newbie_roles(jwt_token, server_url_raw, release_v)
-                ad = {
-                    'account_id': acc_id_raw, 'nickname': nickname_final,
-                    'region': region, 'level': level, 'exp': exp, 'likes': likes,
-                    'open_id': open_id, 'access_token': access_token,
-                    'platform': str(platform), 'token': jwt_token,
-                    'server_time': server_time, 'aes_ak': aes_ak, 'iv_i': iv_i,
-                    'functional_addrs': _gf_field(ld, 14),
-                    'informational_addrs': _gf_field(ld, 32),
-                    'release_version': release_v, 'client_version': game_version,
-                    'server_url': server_url_raw, 'login_payload_data': login_payload,
-                    'auth_type': 'guest', 'auth_uid': uid, 'auth_password': password,
-                }
-                _register_credentials(ad); cache_set(uid, ad); created.append(ad)
-                _prog(f"✅ bot {i+1}: {nickname_final} | UID {acc_id_raw}")
-                await asyncio.sleep(0.6)
-            except Exception as e:
-                _prog(f"❌ bot {i+1}: {e}")
+                    for attempt in range(5):
+                        mp, lp = await get_payload(
+                            access_token, open_id, platform, game_version, lang,
+                            acc_key=str(uid))
+                        res_json = await major_login(mp, login_url, release_v)
+                        if res_json and res_json.get("__JWT__"):
+                            login_payload = lp
+                            break
+                        res_json = None
+                        wait = 3.0 + attempt * 2.0
+                        print_warning(f"[CREATE] bot {i+1} login attempt {attempt+1}/5 failed, wait {wait:.0f}s")
+                        await asyncio.sleep(wait)
+
+                    if not res_json or not res_json.get("__JWT__"):
+                        _prog(f"   ❌ bot {i+1}: MajorLogin failed after 5 attempts")
+                        continue
+
+                    jwt_token = res_json.get("__JWT__")
+                    server_url_raw = res_json.get("__URL__") or "https://loginbp.ggpolarbear.com"
+                    server_time = res_json.get("__TIME__")
+                    acc_id_raw = res_json.get("__ACCID__")
+
+                    if not jwt_token:
+                        _prog(f"   ❌ bot {i+1}: JWT empty")
+                        continue
+                    if not server_url_raw:
+                        server_url_raw = "https://loginbp.ggpolarbear.com"
+
+                    aes_ak, iv_i = _extract_key_iv(res_json)
+                    if not aes_ak or not iv_i:
+                        _prog(f"   ❌ bot {i+1}: AES key/IV missing")
+                        continue
+
+                    ld = await get_login_data(login_payload, jwt_token, server_url_raw, release_v)
+                    level = 1; exp = 0; likes = 0
+                    if ld:
+                        def _gf(f, d=None):
+                            v = ld.get(str(f), {}).get("data")
+                            return v if v is not None else d
+                        level = int(_gf(6, 1) or 1); exp = int(_gf(7, 0) or 0)
+                        likes = int(_gf(8, 0) or 0)
+                        nickname_final = _gf(4, nickname_final) or nickname_final
+
+                    await get_newbie_roles(jwt_token, server_url_raw, release_v)
+                    await asyncio.sleep(0.5)
+                    await set_newbie_roles(jwt_token, server_url_raw, release_v)
+
+                    ad = {
+                        'account_id': acc_id_raw, 'nickname': nickname_final,
+                        'region': region, 'level': level, 'exp': exp, 'likes': likes,
+                        'open_id': open_id, 'access_token': access_token,
+                        'platform': str(platform), 'token': jwt_token,
+                        'server_time': server_time, 'aes_ak': aes_ak, 'iv_i': iv_i,
+                        'functional_addrs': _gf_field(ld, 14),
+                        'informational_addrs': _gf_field(ld, 32),
+                        'release_version': release_v, 'client_version': game_version,
+                        'server_url': server_url_raw, 'login_payload_data': login_payload,
+                        'auth_type': 'guest', 'auth_uid': uid, 'auth_password': password,
+                    }
+                    _register_credentials(ad); cache_set(uid, ad); created.append(ad)
+                    _prog(f"✅ bot {i+1}: {nickname_final} | UID {acc_id_raw}")
+                    bot_ok = True
+                    break
+
+                except Exception as e:
+                    _prog(f"   ❌ bot {i+1} attempt {bot_attempt+1}: {e}")
+                    traceback.print_exc()
+
+            if not bot_ok:
+                _prog(f"❌ bot {i+1}: all attempts failed")
+
+            await asyncio.sleep(7.0)
 
         if not created:
             _prog("❌ No accounts created."); return []
@@ -2237,7 +2325,7 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4):
 
         if group_id:
             _ensure_instance_timer(group_id)
-            _prog(f"⏱ Instance timer started (8h non-stop, auto-delete on expiry)")
+            _prog(f"⏱ Instance timer armed (8h)")
 
         _prog(f"✅ All {len(created)} bots launched.")
         return created
@@ -2351,7 +2439,6 @@ async def api_stats(request):
         matches_rate = int(bot_state.matches_started / uptime_h) if uptime_h > 0 else 0
         running_instances = _active_instance_count()
 
-        # instance ages for dashboard
         instance_ages = {}
         now = time.time()
         for gid, start_ts in _instance_start_times.items():
@@ -2420,7 +2507,7 @@ async def api_create_team(request):
         if running >= MAX_INSTANCES:
             return aiohttp.web.json_response({
                 "ok": False,
-                "error": f"Max {MAX_INSTANCES} instances running. Wait for one to expire or delete manually."
+                "error": f"Max {MAX_INSTANCES} instances running. Wait for expiry."
             })
 
         count = max(1, min(4, count))
